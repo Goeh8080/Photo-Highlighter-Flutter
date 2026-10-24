@@ -28,31 +28,44 @@ class AlbumItem {
 class AlbumRepository {
   static const boxName = 'user_album';
   late Box _box;
+  bool _memory = false;
+  final Map<int, Map> _mem = {};
+  int _memId = 0;
 
   Future<void> init() async {
     await Hive.initFlutter();
     _box = await Hive.openBox(boxName);
   }
 
+  /// If on-device storage can't be opened, keep the album in memory so the
+  /// app still starts (instead of hanging on the splash screen).
+  void useMemoryFallback() => _memory = true;
+
   Future<void> add({required String name, required Uint8List bytes, String? metaState}) async {
     final now = DateTime.now();
     String two(int v) => v.toString().padLeft(2, '0');
     final date = '${now.day}/${now.month}/${now.year} ${two(now.hour)}:${two(now.minute)}';
-    await _box.add({
+    final rec = {
       'name': name,
       'bytes': bytes,
       'date': date,
       'timestamp': now.millisecondsSinceEpoch,
       'sizeKb': (bytes.length / 1024).round(),
       'metaState': metaState,
-    });
+    };
+    if (_memory) {
+      _mem[_memId++] = rec;
+    } else {
+      await _box.add(rec);
+    }
   }
 
   /// Newest first (`getAll().reverse()`).
   List<AlbumItem> all() {
     final out = <AlbumItem>[];
-    for (final k in _box.keys) {
-      final m = Map<String, dynamic>.from(_box.get(k) as Map);
+    final keys = _memory ? _mem.keys.toList() : _box.keys.toList();
+    for (final k in keys) {
+      final m = Map<String, dynamic>.from((_memory ? _mem[k] : _box.get(k)) as Map);
       final raw = m['bytes'];
       out.add(AlbumItem(
         id: k as int,
@@ -67,5 +80,5 @@ class AlbumRepository {
     return out.reversed.toList();
   }
 
-  Future<void> delete(int id) => _box.delete(id);
+  Future<void> delete(int id) async => _memory ? _mem.remove(id) : await _box.delete(id);
 }

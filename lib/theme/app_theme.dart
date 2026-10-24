@@ -130,16 +130,18 @@ class AppColors {
 /// Persists theme just like `localStorage.app_theme_mode`.
 class ThemeController extends ValueNotifier<bool> {
   static const _key = 'app_theme_mode';
-  final SharedPreferences prefs;
+  final SharedPreferences? prefs;
 
-  ThemeController(this.prefs) : super(prefs.getString(_key) == 'light');
+  ThemeController(this.prefs) : super(prefs?.getString(_key) == 'light');
 
   bool get isLight => value;
   AppPalette get palette => value ? AppPalette.light : AppPalette.dark;
 
   Future<void> toggle() async {
     value = !value;
-    await prefs.setString(_key, value ? 'light' : 'dark');
+    try {
+      await prefs?.setString(_key, value ? 'light' : 'dark');
+    } catch (_) {}
   }
 }
 

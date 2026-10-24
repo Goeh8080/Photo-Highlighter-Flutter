@@ -70,3 +70,7 @@ local.properties
 
 # Temp screenshots
 screenshots/_*.png
+android/key.properties
+keystore
+**/keystore
+signed_keystore.zip

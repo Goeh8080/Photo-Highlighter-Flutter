@@ -65,7 +65,7 @@ void main() {
     expect(mid, isNot(AppPalette.light.textMain));
     await t.pumpAndSettle();
     expect(t.widget<Text>(find.text('x')).style!.color, AppPalette.light.textMain);
-    expect(c.prefs.getString('app_theme_mode'), 'light');
+    expect(c.prefs!.getString('app_theme_mode'), 'light');
   });
 
   testWidgets('GlassCheck toggles', (t) async {

@@ -109,3 +109,12 @@ More screenshots are in [`screenshots/`](screenshots/).
 - **Edge detection** is a pure-Dart, Canny-style pipeline. It approximates the original's OpenCV.js `findContours` / `approxPolyDP` rather than matching it exactly.
 - **Very large merges** fall back to the GPU's 8192 px texture limit. An HTML canvas allows larger.
 - **Saving on mobile** writes the file and then opens the share sheet.
+
+
+## Changelog
+
+### v1.0.1
+- **Fix: black screen / stuck on splash on real devices.** The v1.0.0 release build was minified by R8, which renamed plugin methods that `package:jni` (used by `shared_preferences`/`path_provider`) looks up by name -> `NoSuchMethodError` during start-up, and `main()` awaited that call before `runApp`. R8 is now off and keep rules were added.
+- `main()` is now crash-proof: `runApp` runs immediately, storage loads asynchronously with timeouts and an in-memory fallback, and any error shows an on-screen error view instead of a black screen.
+- New app icon (adaptive icon, native splash with the same icon, web icons, SVG master in `assets/icon/icon.svg`).
+- Release APKs are signed with the owner's release key (`android/key.properties` is git-ignored). **Uninstall v1.0.0 first** - the signing key changed.

@@ -60,6 +60,64 @@ class HlShape {
     }
   }
 
+  /// Precise hit test used for tap-to-select / drag-to-move. [world] is in the
+  /// same (image-centre-relative) space as the shape; [tol] is the finger slop
+  /// in the same units (e.g. 24 / zoom). Thin lines/freehand are tested against
+  /// their polyline (so a diagonal stroke does not steal taps through its big
+  /// bounding box), filled shapes against their area and text against its box.
+  bool hitTest(Pt world, double tol) {
+    final c = center();
+    final p = angle == 0 ? world : _rot(world, c, -angle);
+    switch (type) {
+      case 'free':
+        final pl = pts;
+        if (pl == null || pl.isEmpty) return false;
+        final r = thickness / 2 + tol;
+        if (pl.length == 1) return _d2(p, pl[0]) <= r * r;
+        for (var i = 1; i < pl.length; i++) {
+          if (_segD2(p, pl[i - 1], pl[i]) <= r * r) return true;
+        }
+        return false;
+      case 'free_straight':
+        if (start == null || current == null) return false;
+        final r = thickness / 2 + tol;
+        return _segD2(p, start!, current!) <= r * r;
+      case 'oval':
+        if (start == null || current == null) return false;
+        final b = bounds();
+        final a = (b[2] - b[0]) / 2 + tol, bb = (b[3] - b[1]) / 2 + tol;
+        final dx = (p.x - (b[0] + b[2]) / 2) / a, dy = (p.y - (b[1] + b[3]) / 2) / bb;
+        return dx * dx + dy * dy <= 1;
+      case 'text':
+        final b = bounds();
+        final lines = (textValue ?? '').split('\n');
+        final longest = lines.fold<int>(1, (m, l) => math.max(m, l.length));
+        final w = math.max(b[2] - b[0], longest * fontSize * 0.6 + 12);
+        final h = math.max(b[3] - b[1], lines.length * fontSize * 1.2 + 12);
+        return p.x >= b[0] - tol && p.x <= b[0] + w + tol && p.y >= b[1] - tol && p.y <= b[1] + h + tol;
+      default: // rect & friends
+        if (start == null || current == null) return false;
+        final b = bounds();
+        return p.x >= b[0] - tol && p.x <= b[2] + tol && p.y >= b[1] - tol && p.y <= b[3] + tol;
+    }
+  }
+
+  static Pt _rot(Pt p, Pt c, double deg) {
+    final a = deg * math.pi / 180, co = math.cos(a), si = math.sin(a);
+    final dx = p.x - c.x, dy = p.y - c.y;
+    return Pt(c.x + dx * co - dy * si, c.y + dx * si + dy * co);
+  }
+
+  static double _d2(Pt a, Pt b) => (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y);
+
+  static double _segD2(Pt p, Pt a, Pt b) {
+    final dx = b.x - a.x, dy = b.y - a.y;
+    final l2 = dx * dx + dy * dy;
+    if (l2 == 0) return _d2(p, a);
+    final t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / l2).clamp(0.0, 1.0);
+    return _d2(p, Pt(a.x + t * dx, a.y + t * dy));
+  }
+
   /// getShapeCenter()
   Pt center() {
     if (type == 'free' && pts != null && pts!.isNotEmpty) {

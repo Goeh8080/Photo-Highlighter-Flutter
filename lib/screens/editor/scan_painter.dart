@@ -48,39 +48,101 @@ class HighlightRenderer {
     c.restore();
   }
 
-  /// multiply layer → normal (source-over) layers → text layers.
-  static void paintAll(Canvas c, List<HlShape> shapes, {HlShape? drawing, Rect? layerBounds}) {
-    c.saveLayer(layerBounds, Paint()..blendMode = BlendMode.multiply);
-    for (final s in shapes) {
-      if (s.blendMode != 'source-over') _withRotation(c, s, () => _renderShape(c, s));
-    }
-    if (drawing != null && drawing.blendMode != 'source-over') _withRotation(c, drawing, () => _renderShape(c, drawing));
-    c.restore();
+  static final _tpCache = <String, TextPainter>{};
 
-    for (final s in shapes) {
-      if (s.blendMode == 'source-over') _withRotation(c, s, () => _renderShape(c, s));
+  static TextPainter _textPainter(String text, double fontSize, Color col) {
+    final key = '$text|$fontSize|${col.toARGB32()}';
+    var tp = _tpCache[key];
+    if (tp == null) {
+      if (_tpCache.length > 96) _tpCache.clear();
+      tp = TextPainter(
+        text: TextSpan(text: text, style: TextStyle(color: col, fontSize: fontSize, fontWeight: FontWeight.bold, height: 1.0, fontFamily: 'sans-serif')),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      _tpCache[key] = tp;
     }
-    if (drawing != null && drawing.blendMode == 'source-over') _withRotation(c, drawing, () => _renderShape(c, drawing));
+    return tp;
+  }
 
-    for (final s in shapes) {
-      if (s.type == 'text' && (s.textValue ?? '').isNotEmpty && s.start != null && s.current != null) {
-        _withRotation(c, s, () {
-          final minX = math.min(s.start!.x, s.current!.x), minY = math.min(s.start!.y, s.current!.y);
-          final col = (!isWhiteColor(s.color) && Color(s.color).a > 0) ? Color(s.color) : Colors.black;
-          final lineH = s.fontSize * 1.2;
-          final lines = s.textValue!.split('\n');
-          for (var i = 0; i < lines.length; i++) {
-            final tp = TextPainter(
-              text: TextSpan(
-                text: lines[i],
-                style: TextStyle(color: col, fontSize: s.fontSize, fontWeight: FontWeight.bold, height: 1.0, fontFamily: 'sans-serif'),
-              ),
-              textDirection: TextDirection.ltr,
-            )..layout();
-            tp.paint(c, Offset(minX + 6, minY + 6 + i * lineH));
-          }
-        });
+  static void _renderText(Canvas c, HlShape s) {
+    if (s.type != 'text' || (s.textValue ?? '').isEmpty || s.start == null || s.current == null) return;
+    _withRotation(c, s, () {
+      final minX = math.min(s.start!.x, s.current!.x), minY = math.min(s.start!.y, s.current!.y);
+      final col = (!isWhiteColor(s.color) && Color(s.color).a > 0) ? Color(s.color) : Colors.black;
+      final lineH = s.fontSize * 1.2;
+      final lines = s.textValue!.split('\n');
+      for (var i = 0; i < lines.length; i++) {
+        _textPainter(lines[i], s.fontSize, col).paint(c, Offset(minX + 6, minY + 6 + i * lineH));
       }
+    });
+  }
+
+  static bool _isMul(HlShape s) => s.blendMode != 'source-over';
+
+  /// Paint one z-group (0 = multiply, 1 = normal, 2 = text) of [shapes][from..to).
+  static void _group(Canvas c, int g, List<HlShape> shapes, int from, int to) {
+    for (var i = from; i < to; i++) {
+      final s = shapes[i];
+      if (g == 0 && _isMul(s)) {
+        _withRotation(c, s, () => _renderShape(c, s));
+      } else if (g == 1 && !_isMul(s)) {
+        _withRotation(c, s, () => _renderShape(c, s));
+      } else if (g == 2) {
+        _renderText(c, s);
+      }
+    }
+  }
+
+  /// multiply layer → normal (source-over) layers → text layers.
+  ///
+  /// With a [cache] (see [ShapeCache]) everything except the layer being
+  /// dragged is replayed from pre-recorded pictures, so a drag frame only
+  /// re-records ONE shape.
+  static void paintAll(Canvas c, List<HlShape> shapes, {HlShape? drawing, Rect? layerBounds, ShapeCache? cache}) {
+    final skip = cache?.skip ?? -1;
+    void group(int g) {
+      if (cache != null) {
+        c.drawPicture(cache.below[g]);
+        if (skip >= 0 && skip < shapes.length) _group(c, g, shapes, skip, skip + 1);
+        c.drawPicture(cache.above[g]);
+      } else {
+        _group(c, g, shapes, 0, shapes.length);
+      }
+      if (drawing != null) {
+        if (g == 0 && _isMul(drawing)) _withRotation(c, drawing, () => _renderShape(c, drawing));
+        if (g == 1 && !_isMul(drawing)) _withRotation(c, drawing, () => _renderShape(c, drawing));
+      }
+    }
+
+    c.saveLayer(layerBounds, Paint()..blendMode = BlendMode.multiply);
+    group(0);
+    c.restore();
+    group(1);
+    group(2);
+  }
+}
+
+/// Pre-recorded pictures of every layer except [skip] (the one being dragged),
+/// split into "below" and "above" it so z-order is preserved exactly. Built once
+/// at pointer-down, disposed at pointer-up.
+class ShapeCache {
+  final int skip;
+  final List<ui.Picture> below = [], above = [];
+
+  ShapeCache(List<HlShape> shapes, this.skip) {
+    for (var g = 0; g < 3; g++) {
+      for (final part in [(0, skip), (skip + 1, shapes.length)]) {
+        final rec = ui.PictureRecorder();
+        final c = Canvas(rec);
+        HighlightRenderer._group(c, g, shapes, part.$1, part.$2);
+        (part.$1 == 0 ? below : above).add(rec.endRecording());
+      }
+    }
+  }
+
+  void dispose() {
+    for (final p in [...below, ...above]) {
+      p.dispose();
     }
   }
 }
@@ -97,6 +159,7 @@ class ScanViewState {
   final int selectedIndex;
   final bool dpadOpen;
   final List<Pt> pts;
+  final ShapeCache? cache;
   ScanViewState({
     required this.image,
     this.previewFilter,
@@ -112,6 +175,7 @@ class ScanViewState {
     required this.selectedIndex,
     required this.dpadOpen,
     required this.pts,
+    this.cache,
   });
 }
 
@@ -156,7 +220,7 @@ class ScanPainter extends CustomPainter {
     canvas.restore();
 
     // highlights
-    HighlightRenderer.paintAll(canvas, v.shapes, drawing: v.drawing, layerBounds: Rect.fromLTWH(-sw / 2, -sh / 2, sw, sh));
+    HighlightRenderer.paintAll(canvas, v.shapes, drawing: v.drawing, layerBounds: Rect.fromLTWH(-sw / 2, -sh / 2, sw, sh), cache: v.cache);
 
     // selection handles
     if (v.editorMode == 'highlight' && !v.dpadOpen && v.selectedIndex >= 0 && v.selectedIndex < v.shapes.length) {
@@ -218,7 +282,7 @@ class ScanPainter extends CustomPainter {
       for (final hp in crop8Points(v.pts)) {
         final o = Offset(hp.$1 - sw / 2, hp.$2 - sh / 2);
         if (hp.$3) {
-          canvas.drawCircle(o, 10 / z, Paint()..color = _crop);
+          canvas.drawCircle(o, 12 / z, Paint()..color = _crop);
           canvas.drawCircle(
               o,
               10 / z,

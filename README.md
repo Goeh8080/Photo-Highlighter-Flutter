@@ -105,13 +105,21 @@ More screenshots are in [`screenshots/`](screenshots/).
 
 ## Notes
 
-- **OCR** uses tesseract.js on the web. It is not available on mobile builds.
+- **OCR** uses tesseract.js on the web and on-device Google ML Kit (Latin + Devanagari/Hindi) on Android. Result sheet: Copy / Share / Add as text layer.
 - **Edge detection** is a pure-Dart, Canny-style pipeline. It approximates the original's OpenCV.js `findContours` / `approxPolyDP` rather than matching it exactly.
 - **Very large merges** fall back to the GPU's 8192 px texture limit. An HTML canvas allows larger.
 - **Saving on mobile** writes the file and then opens the share sheet.
 
 
 ## Changelog
+
+### v1.0.2
+- **Move any layer.** Tap a layer (rectangle, oval, thin line, freehand, text) to select it and drag it with one finger; precise hit-testing picks the top-most layer (24 px finger slop). Handles for resize/rotate stay. A liquid-glass **Select / Move** tool makes empty taps only deselect (never draw). Each layer keeps its own position, blend mode and colour; moves are undo/redo-able and the layer list stays in sync.
+- **Smooth dragging.** Drag starts on pointer-down (raw `Listener`), is exactly 1:1 with the finger (snapping off by default), Zoom & Pan is locked during a layer drag, only the canvas repaints (no whole-screen `setState`), the non-moving layers are cached as one `Picture`, and history is committed on pointer-up only.
+- **Scan editor.** Single liquid-glass **Done** button applies every pending change (crop frame, rotation, canvas size, OCR text) and returns home; **Cancel** discards everything (including rotation / canvas size, which previously leaked). The crop warp now runs on the CPU (isolate) on Android with GPU fallback, errors are shown instead of silently leaving the old photo, and the home thumbnail / highlight-editor input refresh from the new bytes.
+- **On-device OCR on Android** (ML Kit, Latin + Devanagari) with a glass result sheet; tesseract.js stays on web. minSdk is now 24.
+- Fixes: crash dragging crop handles when auto-detect found no quad, magnifier hidden under the bottom bar, button rows overflowing on narrow phones.
+- Tests: widget/logic tests (`test/layer_test.dart`, `test/editor_test.dart`) and Playwright web flows in `e2e/`.
 
 ### v1.0.1
 - **Fix: black screen / stuck on splash on real devices.** The v1.0.0 release build was minified by R8, which renamed plugin methods that `package:jni` (used by `shared_preferences`/`path_provider`) looks up by name -> `NoSuchMethodError` during start-up, and `main()` awaited that call before `runApp`. R8 is now off and keep rules were added.

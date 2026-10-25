@@ -27,7 +27,8 @@ android {
         applicationId = "com.goutam.photohighlighter"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // ML Kit text recognition needs API 21+; 24 keeps us safely above it.
+        minSdk = maxOf(flutter.minSdkVersion, 24)
         targetSdk = flutter.targetSdkVersion
         // Uses the version code from pubspec.yaml. When using split APKs, 1000 * ABI_VERSION
         // is added automatically by Flutter. (https://developer.android.com/studio/build/configure-apk-splits#configure-APK-versions)
@@ -70,4 +71,9 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    // Hindi / Devanagari OCR model for google_mlkit_text_recognition (Latin is bundled by the plugin).
+    implementation("com.google.mlkit:text-recognition-devanagari:16.0.1")
 }

@@ -14,3 +14,11 @@
 -keep class kotlin.jvm.functions.** { *; }
 -keep class kotlinx.coroutines.** { *; }
 -keepattributes Signature,*Annotation*,InnerClasses,EnclosingMethod
+
+# ML Kit text recognition (kept even though minify is off, in case it is turned on)
+-keep class com.google.mlkit.** { *; }
+-keep class com.google_mlkit_text_recognition.** { *; }
+-keep class com.google_mlkit_commons.** { *; }
+-dontwarn com.google.mlkit.vision.text.chinese.**
+-dontwarn com.google.mlkit.vision.text.japanese.**
+-dontwarn com.google.mlkit.vision.text.korean.**

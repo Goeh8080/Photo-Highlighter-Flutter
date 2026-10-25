@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/painting.dart';
 
 import '../models/hl_shape.dart';
@@ -334,6 +335,31 @@ class ImageOps {
   /// Implemented as a GPU textured mesh: a 32×32 grid of triangles whose
   /// texture coordinates come from the exact homography.
   static Future<ui.Image> perspectiveWarp(ui.Image src, List<Offset> quad, int newW, int newH) async {
+    // On Android/iOS use the deterministic CPU warp (background isolate): the
+    // GPU textured-mesh path depends on the driver/Impeller backend and a failed
+    // or blank surface there made the crop silently "not apply" on some phones.
+    if (!isWebPlatform) {
+      try {
+        return await perspectiveWarpCpu(src, quad, newW, newH);
+      } catch (_) {
+        // fall through to the GPU path
+      }
+    }
+    return perspectiveWarpGpu(src, quad, newW, newH);
+  }
+
+  /// Bilinear perspective warp on the CPU, run in a background isolate.
+  static Future<ui.Image> perspectiveWarpCpu(ui.Image src, List<Offset> quad, int newW, int newH) async {
+    final hm = _homography(
+      [const Offset(0, 0), Offset(newW.toDouble(), 0), Offset(newW.toDouble(), newH.toDouble()), Offset(0, newH.toDouble())],
+      quad,
+    );
+    final px = await rgba(src);
+    final out = await compute(_warpCpu, _WarpArgs(px, src.width, src.height, hm, newW, newH));
+    return fromRgba(out, newW, newH);
+  }
+
+  static Future<ui.Image> perspectiveWarpGpu(ui.Image src, List<Offset> quad, int newW, int newH) async {
     final hm = _homography(
       [const Offset(0, 0), Offset(newW.toDouble(), 0), Offset(newW.toDouble(), newH.toDouble()), Offset(0, newH.toDouble())],
       quad,
@@ -403,3 +429,38 @@ class ImageOps {
   }
 }
 
+
+
+class _WarpArgs {
+  final Uint8List rgba;
+  final int sw, sh, w, h;
+  final List<double> hm;
+  _WarpArgs(this.rgba, this.sw, this.sh, this.hm, this.w, this.h);
+}
+
+Uint8List _warpCpu(_WarpArgs a) {
+  final out = Uint8List(a.w * a.h * 4);
+  final src = a.rgba, hm = a.hm, sw = a.sw, sh = a.sh;
+  var o = 0;
+  for (var y = 0; y < a.h; y++) {
+    final yy = y + 0.5;
+    for (var x = 0; x < a.w; x++) {
+      final xx = x + 0.5;
+      final d = hm[6] * xx + hm[7] * yy + 1;
+      final u = (hm[0] * xx + hm[1] * yy + hm[2]) / d - 0.5;
+      final v = (hm[3] * xx + hm[4] * yy + hm[5]) / d - 0.5;
+      final x0 = u.floor(), y0 = v.floor();
+      final fx = u - x0, fy = v - y0;
+      final xa = x0.clamp(0, sw - 1), xb = (x0 + 1).clamp(0, sw - 1);
+      final ya = y0.clamp(0, sh - 1), yb = (y0 + 1).clamp(0, sh - 1);
+      final i00 = (ya * sw + xa) * 4, i10 = (ya * sw + xb) * 4, i01 = (yb * sw + xa) * 4, i11 = (yb * sw + xb) * 4;
+      final w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;
+      out[o] = (src[i00] * w00 + src[i10] * w10 + src[i01] * w01 + src[i11] * w11 + 0.5).toInt();
+      out[o + 1] = (src[i00 + 1] * w00 + src[i10 + 1] * w10 + src[i01 + 1] * w01 + src[i11 + 1] * w11 + 0.5).toInt();
+      out[o + 2] = (src[i00 + 2] * w00 + src[i10 + 2] * w10 + src[i01 + 2] * w01 + src[i11 + 2] * w11 + 0.5).toInt();
+      out[o + 3] = 255;
+      o += 4;
+    }
+  }
+  return out;
+}

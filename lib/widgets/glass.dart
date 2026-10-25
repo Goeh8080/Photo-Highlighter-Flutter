@@ -444,7 +444,7 @@ class GlassSelect<T> extends StatelessWidget {
           if (expand)
             Expanded(child: _label(p))
           else
-            _label(p),
+            Flexible(child: _label(p)),
           const SizedBox(width: 4),
           Icon(Icons.expand_more_rounded, size: fontSize + 5, color: p.textSub),
         ]),

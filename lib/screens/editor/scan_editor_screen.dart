@@ -4,19 +4,23 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_animate/flutter_animate.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../../models/constants.dart';
 import '../../models/hl_shape.dart';
 import '../../models/photo_item.dart';
 import '../../services/edge_detector.dart';
 import '../../services/image_ops.dart';
+import '../../services/ocr_text.dart';
 import '../../services/platform.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/glass.dart';
 import '../../widgets/glass_dialog.dart';
 import '../../widgets/glass_toast.dart';
 import 'editor_windows.dart';
+import 'layer_drag.dart';
 import 'scan_painter.dart';
 
 /// Port of `#scanModal`: perspective crop ("Scan") and highlight editor
@@ -39,6 +43,47 @@ class _Bounds {
   _Bounds({required this.start, required this.current, this.pts, this.angle = 0, required this.center});
 }
 
+/// Everything the editor can change on the item while open, so Cancel (or the
+/// system back gesture) really discards it.
+class _ItemSnapshot {
+  final Uint8List orig, display;
+  final Uint8List? croppedBase, adjBase;
+  final List<Pt>? savedPts;
+  final int rotation;
+  final double? viewW;
+  final AdjSettings adj;
+  final List<HlShape> shapes;
+  final List<HistoryEntry> history;
+  final List<OcrWord> ocr;
+  _ItemSnapshot(PhotoItem o)
+      : orig = o.orig,
+        display = o.display,
+        croppedBase = o.croppedBase,
+        adjBase = o.adjBase,
+        savedPts = o.savedPts?.map((p) => Pt(p.x, p.y)).toList(),
+        rotation = o.rotation,
+        viewW = o.viewW,
+        adj = o.adj.copy(),
+        shapes = o.hlShapes.map((e) => e.clone()).toList(),
+        history = o.hlRedoStack.map((e) => HistoryEntry.fromJson(e.toJson())).toList(),
+        ocr = o.ocrWords.map((w) => OcrWord.fromJson(w.toJson())).toList();
+
+  void restore(PhotoItem o) {
+    o
+      ..orig = orig
+      ..display = display
+      ..croppedBase = croppedBase
+      ..adjBase = adjBase
+      ..savedPts = savedPts
+      ..rotation = rotation
+      ..viewW = viewW
+      ..adj = adj
+      ..hlShapes = shapes
+      ..hlRedoStack = history
+      ..ocrWords = ocr;
+  }
+}
+
 class _ScanEditorScreenState extends State<ScanEditorScreen> {
   PhotoItem get o => widget.item;
   late final String modalEntryMode = widget.entryMode;
@@ -47,8 +92,17 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
   ui.Image? scanImg;
   ui.Image? previewImg; // adjustments preview with B&W pass
   ColorFilter? previewFilter;
+  /// `tick` repaints the canvas painter; `overlayTick` rebuilds the (widget)
+  /// overlays – OCR boxes, magnifier, text input. A layer drag only bumps
+  /// `tick` ([redrawCanvas]) so no widget is rebuilt per pointer move.
   final tick = ValueNotifier<int>(0);
-  void redraw() => tick.value++;
+  final overlayTick = ValueNotifier<int>(0);
+  void redraw() {
+    tick.value++;
+    overlayTick.value++;
+  }
+
+  void redrawCanvas() => tick.value++;
 
   // view
   int rotation = 0;
@@ -82,7 +136,16 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
   int hlResizeHandle = -1;
   Pt? hlDragStart;
   _Bounds? orig;
-  bool snapping = true;
+  bool snapping = false; // off by default: drag follows the finger 1:1
+  bool moveTool = false; // explicit liquid-glass "Select/Move" tool
+  LayerDrag? _layerDrag; // move drag in progress
+  HlShape? _dragBefore; // pre-drag snapshot (history entry on pointer up)
+  int _dragIdx = -1;
+  bool _dragDirty = false;
+  ShapeCache? _dragCache; // pictures of every other layer while dragging
+  /// Test/diagnostic counter: number of canvas repaints requested by drags.
+  int dragRepaints = 0;
+  final _ignoredPointers = <int>{};
   final dupDist = TextEditingController(text: '15');
   double? alignV, alignH;
 
@@ -93,6 +156,11 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
 
   // panels
   bool collapsed = false;
+  bool _collapseInit = false;
+  late final _ItemSnapshot _snap = _ItemSnapshot(widget.item);
+  bool _committed = false;
+  String ocrText = '';
+  String? _pendingOcrText; // OCR text the user chose to add; burnt in on Done
   bool layersOpen = false;
   final layerLink = LayerLink();
   final _layersBtnKey = GlobalKey();
@@ -113,7 +181,18 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
   @override
   void initState() {
     super.initState();
+    _snap; // capture the pre-edit state
     _load();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_collapseInit) {
+      _collapseInit = true;
+      // Small phones start with the compact option set so the photo stays big.
+      collapsed = MediaQuery.sizeOf(context).height < 700;
+    }
   }
 
   Future<void> _load() async {
@@ -130,8 +209,11 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
 
   @override
   void dispose() {
+    if (!_committed) _snap.restore(widget.item);
     _adjDebounce?.cancel();
+    _dragCache?.dispose();
     tick.dispose();
+    overlayTick.dispose();
     textCtl.dispose();
     textFocus.dispose();
     super.dispose();
@@ -175,6 +257,10 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
     }
   }
 
+  /// Unclamped canvas coordinates – used for layer drags so the layer follows
+  /// the finger 1:1 even when the finger leaves the image area.
+  Pt rawCoords(Offset l) => Pt((l.dx - (sw / 2 + panX)) / zoom, (l.dy - (sh / 2 + panY)) / zoom);
+
   Pt canvasCoords(Offset l) {
     var x = (l.dx - (sw / 2 + panX)) / zoom;
     var y = (l.dy - (sh / 2 + panY)) / zoom;
@@ -217,6 +303,7 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
         selectedIndex: selected,
         dpadOpen: dpadOpen,
         pts: pts,
+        cache: _dragCache,
       );
 
   // ---------------------------------------------------------------- helpers
@@ -263,18 +350,72 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
     redraw();
   }
 
+  // ---------------------------------------------------------------- layer drag
+  /// Finger slop (canvas units) for selecting a layer. Thin strokes and text
+  /// always get the full 24 px; filled shapes get a tighter slop while a
+  /// drawing tool is active so they do not swallow the start of a new shape.
+  double _hitTol(HlShape s) {
+    final full = 24 / zoom;
+    if (moveTool || s.type == 'free' || s.type == 'free_straight' || s.type == 'text') return full;
+    return 8 / zoom;
+  }
+
+  int _hitLayer(Pt world) {
+    for (var i = shapes.length - 1; i >= 0; i--) {
+      if (shapes[i].hitTest(world, _hitTol(shapes[i]))) return i;
+    }
+    return -1;
+  }
+
+  void _beginDrag(String mode, int idx, Pt pt, Pt raw) {
+    hideTextInput();
+    selected = idx;
+    hlDragMode = mode;
+    hlDragStart = pt;
+    _dragIdx = idx;
+    _dragDirty = false;
+    final s = shapes[idx];
+    _dragBefore = s.clone();
+    _dragCache?.dispose();
+    _dragCache = ShapeCache(shapes, idx);
+    if (mode == 'move') {
+      _layerDrag = LayerDrag(idx, s, raw);
+    }
+  }
+
+  /// Pointer up / second finger: commit ONE history entry (only if the layer
+  /// really changed), release the picture cache.
+  void _endDrag() {
+    if (_dragBefore != null && _dragDirty && _dragIdx >= 0 && _dragIdx < shapes.length) {
+      o.hlRedoStack.add(HistoryEntry('edit', index: _dragIdx, shape: _dragBefore));
+    }
+    _dragBefore = null;
+    _layerDrag = null;
+    _dragIdx = -1;
+    _dragCache?.dispose();
+    _dragCache = null;
+    hlDragMode = null;
+  }
+
   // ---------------------------------------------------------------- pointer
   void _onDown(PointerDownEvent e) {
     if (scanImg == null) return;
     if (layersOpen) setState(() => layersOpen = false);
     touches[e.pointer] = e.localPosition;
+    if (touches.length == 2 && hlDragMode != null) {
+      // Zoom & pan are disabled while a layer is being dragged: a stray second
+      // finger is ignored instead of hijacking the drag.
+      touches.remove(e.pointer);
+      _ignoredPointers.add(e.pointer);
+      return;
+    }
     if (touches.length == 2) {
       hideTextInput();
       isPanning = false;
       drag = -1;
       dragEdgeMidIdx = -1;
       isDrawing = false;
-      hlDragMode = null;
+      _endDrag();
       final a = touches.values.first, b = touches.values.last;
       initialPinchDist = (a - b).distance;
       initialScale = zoom;
@@ -285,6 +426,7 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
     }
     final l = e.localPosition;
     final pt = canvasCoords(l);
+    final raw = rawCoords(l);
     var type = shapeType;
 
     if (editorMode == 'zoom') {
@@ -301,11 +443,8 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
         final rp = applyRotation(Pt(tc.x, tc.y - 25 / zoom), c, angle);
         final sx = rp.x * zoom + (sw / 2 + panX), sy = rp.y * zoom + (sh / 2 + panY);
         if ((Offset(sx, sy) - l).distance < 25) {
-          hideTextInput();
-          hlDragMode = 'rotate';
-          hlDragStart = pt;
+          _beginDrag('rotate', selected, pt, raw);
           orig = _Bounds(start: Pt(0, 0), current: Pt(0, 0), angle: angle, center: c);
-          _pushEdit(selected);
           return;
         }
         var found = -1;
@@ -315,10 +454,8 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
           if ((Offset(rh.x * zoom + sw / 2 + panX, rh.y * zoom + sh / 2 + panY) - l).distance < 25) found = i;
         }
         if (found >= 0) {
-          hideTextInput();
-          hlDragMode = 'resize';
+          _beginDrag('resize', selected, pt, raw);
           hlResizeHandle = found;
-          hlDragStart = pt;
           orig = _Bounds(
             start: s.start?.copy() ?? Pt(0, 0),
             current: s.current?.copy() ?? Pt(0, 0),
@@ -326,44 +463,37 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
             angle: angle,
             center: c,
           );
-          _pushEdit(selected);
-          return;
-        }
-        final up = applyRotation(pt, c, -angle);
-        final b = s.bounds();
-        if (up.x >= b[0] - 10 && up.x <= b[2] + 10 && up.y >= b[1] - 10 && up.y <= b[3] + 10) {
-          hideTextInput();
-          hlDragMode = 'move';
-          hlDragStart = pt;
-          orig = _Bounds(start: s.start?.copy() ?? Pt(0, 0), current: s.current?.copy() ?? Pt(0, 0), pts: s.pts?.map((p) => p.copy()).toList(), center: c);
-          _pushEdit(selected);
           return;
         }
       }
-      var tapped = -1;
-      for (var k = shapes.length - 1; k >= 0; k--) {
-        final s = shapes[k];
-        final up = applyRotation(pt, s.center(), -s.angle);
+      // Top-most layer under the finger (precise geometry + finger slop).
+      var tapped = _hitLayer(raw);
+      if (tapped < 0 && selected >= 0 && selected < shapes.length) {
+        // Fallback: inside the selected layer's (rotated) bounds ±slop.
+        final s = shapes[selected];
+        final up = applyRotation(raw, s.center(), -s.angle);
         final b = s.bounds();
-        if (up.x >= b[0] - 10 && up.x <= b[2] + 10 && up.y >= b[1] - 10 && up.y <= b[3] + 10) {
-          tapped = k;
-          break;
-        }
+        final t = 10 / zoom;
+        if (up.x >= b[0] - t && up.x <= b[2] + t && up.y >= b[1] - t && up.y <= b[3] + t) tapped = selected;
       }
       if (tapped >= 0) {
-        hideTextInput();
-        selected = tapped;
+        // Start moving IMMEDIATELY on pointer-down (raw Listener events, no
+        // gesture arena). No setState here: only the canvas repaints; the
+        // toolbar/layer-list refresh once on pointer-up.
         shapeType = 'select';
-        handleShapeTypeChange();
-        final cs = shapes[selected];
-        _syncSliderFromShape(cs);
-        hlDragMode = 'move';
-        hlDragStart = pt;
-        orig = _Bounds(start: cs.start?.copy() ?? Pt(0, 0), current: cs.current?.copy() ?? Pt(0, 0), pts: cs.pts?.map((p) => p.copy()).toList(), center: cs.center());
+        _syncSliderFromShape(shapes[tapped]);
+        _beginDrag('move', tapped, pt, raw);
+        redrawCanvas();
         return;
       } else if (type == 'select') {
         hideTextInput();
         selected = -1;
+        if (moveTool) {
+          // Select/Move tool: an empty tap only deselects, never draws.
+          setState(() {});
+          redraw();
+          return;
+        }
         shapeType = prevDrawingType;
         type = shapeType;
         handleShapeTypeChange();
@@ -383,7 +513,7 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
       for (var i = 0; i < c8.length; i++) {
         final sx = (c8[i].$1 - sw / 2) * zoom + (sw / 2 + panX);
         final sy = (c8[i].$2 - sh / 2) * zoom + (sh / 2 + panY);
-        if ((Offset(sx, sy) - l).distance < 30) hit = i;
+        if ((Offset(sx, sy) - l).distance < 36) hit = i; // 72 px grab area
       }
       if (hit >= 0) {
         initialDragPts = pts.map((p) => p.copy()).toList();
@@ -423,54 +553,47 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
       panX = l.dx - startX;
       panY = l.dy - startY;
       redraw();
+    } else if (editorMode == 'highlight' && hlDragMode == 'move' && _layerDrag != null && _dragIdx >= 0 && _dragIdx < shapes.length) {
+      // 1:1 direct manipulation: position = original + (pointer - pointerAtDown)
+      final d = _layerDrag!;
+      d.update(rawCoords(l));
+      alignV = null;
+      alignH = null;
+      if (snapping) {
+        // optional *soft* snap (6 px) to other layers' centres
+        final th = 6 / zoom;
+        final s = d.shape;
+        final cc = s.center();
+        double sx = 0, sy = 0;
+        for (var t = 0; t < shapes.length; t++) {
+          if (t == _dragIdx) continue;
+          final tc = shapes[t].center();
+          if ((cc.x - tc.x).abs() < th) {
+            sx = tc.x - cc.x;
+            alignV = sw / 2 + panX + tc.x * zoom;
+          }
+          if ((cc.y - tc.y).abs() < th) {
+            sy = tc.y - cc.y;
+            alignH = sh / 2 + panY + tc.y * zoom;
+          }
+        }
+        if (sx != 0 || sy != 0) d.update(rawCoords(l), snapX: sx, snapY: sy);
+      }
+      _dragDirty = d.moved;
+      dragRepaints++;
+      if (alignV != null || alignH != null) {
+        redraw();
+      } else {
+        redrawCanvas();
+      }
     } else if (editorMode == 'highlight' && hlDragMode != null && selected >= 0 && orig != null) {
       final s = shapes[selected];
+      _dragDirty = true;
       if (hlDragMode == 'rotate') {
         final c = orig!.center;
         final a0 = math.atan2(hlDragStart!.y - c.y, hlDragStart!.x - c.x);
         final a1 = math.atan2(pt.y - c.y, pt.x - c.x);
         s.angle = (orig!.angle + (a1 - a0) * 180 / math.pi) % 360;
-      } else if (hlDragMode == 'move') {
-        final dx = pt.x - hlDragStart!.x, dy = pt.y - hlDragStart!.y;
-        if (s.start != null) s.start = Pt(orig!.start.x + dx, orig!.start.y + dy);
-        if (s.current != null) s.current = Pt(orig!.current.x + dx, orig!.current.y + dy);
-        if (s.type == 'free' && s.pts != null && orig!.pts != null) s.pts = orig!.pts!.map((p) => Pt(p.x + dx, p.y + dy)).toList();
-        alignV = null;
-        alignH = null;
-        if (snapping) {
-          final th = 6 / zoom;
-          for (var t = 0; t < shapes.length; t++) {
-            if (t == selected) continue;
-            final tc = shapes[t].center();
-            final cc = s.center();
-            if ((cc.x - tc.x).abs() < th) {
-              final shift = tc.x - cc.x;
-              if (s.start != null) {
-                s.start!.x += shift;
-                s.current!.x += shift;
-              }
-              if (s.type == 'free' && s.pts != null) {
-                for (final p in s.pts!) {
-                  p.x += shift;
-                }
-              }
-              alignV = sw / 2 + panX + tc.x * zoom;
-            }
-            if ((cc.y - tc.y).abs() < th) {
-              final shift = tc.y - cc.y;
-              if (s.start != null) {
-                s.start!.y += shift;
-                s.current!.y += shift;
-              }
-              if (s.type == 'free' && s.pts != null) {
-                for (final p in s.pts!) {
-                  p.y += shift;
-                }
-              }
-              alignH = sh / 2 + panY + tc.y * zoom;
-            }
-          }
-        }
       } else if (hlDragMode == 'resize') {
         final c = orig!.center, angle = orig!.angle;
         final up = applyRotation(pt, c, -angle), us = applyRotation(hlDragStart!, c, -angle);
@@ -501,7 +624,8 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
           s.current = Pt(maxX, maxY);
         }
       }
-      redraw();
+      dragRepaints++;
+      redrawCanvas();
     } else if (isDrawing && shapeType != 'select') {
       shapeCurrent = pt;
       if (editorMode == 'highlight' && shapeType == 'free') currentLine.add(pt);
@@ -514,7 +638,7 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
         px = px.clamp(0, sw);
         py = py.clamp(0, sh);
         pts[drag] = Pt(px, py);
-        o.savedPts![drag] = Pt(px / sw, py / sh);
+        o.savedPts = pts.map((p) => Pt(p.x / sw, p.y / sh)).toList();
         magPos = l;
         redraw();
       } else if (dragEdgeMidIdx >= 0 && initialDragPts != null) {
@@ -530,6 +654,7 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
   }
 
   void _onUp(PointerEvent e) {
+    if (_ignoredPointers.remove(e.pointer)) return;
     alignV = null;
     alignH = null;
     if (isDrawing && shapeType != 'select') {
@@ -555,8 +680,10 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
         if (t == 'text') showTextInputForShape(selected);
       }
     } else if (editorMode == 'highlight' && hlDragMode != null && selected >= 0 && selected < shapes.length) {
-      if (shapes[selected].type == 'text') showTextInputForShape(selected);
+      // A tap on a text layer (no movement) opens the keyboard; dragging it doesn't.
+      if (shapes[selected].type == 'text' && !_dragDirty) showTextInputForShape(selected);
     }
+    if (hlDragMode != null) _endDrag();
     touches.remove(e.pointer);
     if (touches.length == 1) {
       final r = touches.values.first;
@@ -916,27 +1043,148 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
 
   // ---- OCR
   Future<void> runOCRScan() async {
+    if (ocrBusy) return;
     setState(() => ocrBusy = true);
     try {
       final rot = await ImageOps.rotated(scanImg!, rotation);
-      final bytes = await ImageOps.encodeJpeg(rot, 0.92);
+      // For crop mode OCR the *cropped* region (what Done will produce) is read.
+      var src = rot;
+      if (modalEntryMode == 'crop' && pts.length == 4) {
+        final rx = rot.width / sw, ry = rot.height / sh;
+        final q = pts.map((p) => Offset(p.x * rx, p.y * ry)).toList();
+        final w = math.max(1, math.max((q[1] - q[0]).distance, (q[2] - q[3]).distance).floor());
+        final h = math.max(1, math.max((q[1] - q[2]).distance, (q[0] - q[3]).distance).floor());
+        if (w > 16 && h > 16) src = await ImageOps.perspectiveWarp(rot, q, w, h);
+      }
+      final bytes = await ImageOps.encodeJpeg(src, 0.92);
       final words = await runOcrPlatform(bytes);
-      final sx = sw / rot.width, sy = sh / rot.height;
-      o.ocrWords = [
-        for (final w in words)
-          OcrWord(
-            text: w['text'] as String,
-            x: (w['x0'] as double) * sx - sw / 2,
-            y: (w['y1'] as double) * sy - sh / 2,
-            w: ((w['x1'] as double) - (w['x0'] as double)) * sx,
-            h: ((w['y1'] as double) - (w['y0'] as double)) * sy,
-          ),
-      ];
-    } catch (e) {
-      if (mounted) await showGlassAlert(context, 'OCR karne me error aayi!${isWebPlatform ? '' : '\n(OCR uses tesseract.js – available in the web build)'}');
+      ocrText = ocrTextFromWords(words);
+      if (modalEntryMode != 'crop') {
+        final sx = sw / src.width, sy = sh / src.height;
+        o.ocrWords = [
+          for (final w in words)
+            OcrWord(
+              text: w['text'] as String,
+              x: (w['x0'] as double) * sx - sw / 2,
+              y: (w['y1'] as double) * sy - sh / 2,
+              w: ((w['x1'] as double) - (w['x0'] as double)) * sx,
+              h: ((w['y1'] as double) - (w['y0'] as double)) * sy,
+            ),
+        ];
+      }
+      if (mounted) {
+        setState(() => ocrBusy = false);
+        redraw();
+        if (ocrText.trim().isEmpty) {
+          toast('No text found in this image');
+        } else {
+          await _showOcrSheet();
+        }
+      }
+    } catch (e, st) {
+      debugPrint('OCR failed: $e\n$st');
+      if (mounted) await showGlassAlert(context, 'OCR karne me error aayi!\n$e');
     } finally {
       if (mounted) setState(() => ocrBusy = false);
       redraw();
+    }
+  }
+
+  /// Liquid-glass result sheet: Copy / Share / add as a text layer.
+  Future<void> _showOcrSheet() async {
+    final p = AppThemeScope.of(context);
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: Colors.black54,
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: GlassContainer(
+            radius: 22,
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+            child: Material(
+              type: MaterialType.transparency,
+              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                Text('📄 Recognized Text', style: TextStyle(color: p.textMain, fontSize: 16, fontWeight: FontWeight.w800)),
+                const SizedBox(height: 10),
+                ConstrainedBox(
+                  constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(ctx).height * 0.4),
+                  child: SingleChildScrollView(
+                    child: SelectableText(ocrText, key: const Key('ocrResultText'), style: TextStyle(color: p.textMain, fontSize: 14, height: 1.35)),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                Wrap(spacing: 8, runSpacing: 8, children: [
+                  SizedBox(
+                    height: 44,
+                    child: GlassButton(
+                      label: 'Copy',
+                      emoji: '📋',
+                      color: AppColors.blue,
+                      bold: true,
+                      onTap: () async {
+                        await Clipboard.setData(ClipboardData(text: ocrText));
+                        if (ctx.mounted) Navigator.of(ctx).pop();
+                        toast('Text copied');
+                      },
+                    ),
+                  ),
+                  SizedBox(
+                    height: 44,
+                    child: GlassButton(
+                      label: 'Share',
+                      emoji: '📤',
+                      color: AppColors.teal,
+                      bold: true,
+                      onTap: () async {
+                        try {
+                          await SharePlus.instance.share(ShareParams(text: ocrText));
+                        } catch (e) {
+                          toast('Share failed');
+                        }
+                      },
+                    ),
+                  ),
+                  SizedBox(
+                    height: 44,
+                    child: GlassButton(
+                      label: modalEntryMode == 'crop' ? 'Add to photo on Done' : 'Add as text layer',
+                      emoji: '🔤',
+                      color: AppColors.green,
+                      bold: true,
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _applyOcrText();
+                      },
+                    ),
+                  ),
+                  SizedBox(height: 44, child: GlassButton(label: 'Close', color: AppColors.darkGrey, onTap: () => Navigator.of(ctx).pop())),
+                ]),
+              ]),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Highlight editor: add the text as a normal movable layer. Crop editor:
+  /// remember it and burn it into the photo when Done is pressed.
+  void _applyOcrText() {
+    if (ocrText.trim().isEmpty) return;
+    if (modalEntryMode == 'highlight') {
+      final sh0 = ocrTextLayer(ocrText, sw, sh, 0xFF000000);
+      shapes.add(sh0);
+      o.hlRedoStack = [];
+      selected = shapes.length - 1;
+      setState(() {});
+      redraw();
+      toast('Text layer added');
+    } else {
+      _pendingOcrText = ocrText;
+      toast('Text will be added to the photo when you press Done');
     }
   }
 
@@ -973,28 +1221,30 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
 
   // ---- apply / close
   Future<void> applyScan() async {
+    if (busy != null || scanImg == null) return;
     hideTextInput();
     dpadOpen = false;
     if (adjOpen) closeAdjustments();
     final img = scanImg!;
     setState(() => busy = 'Applying…');
     try {
+      PhotoItem result;
       if (modalEntryMode == 'highlight') {
         final w = img.width, h = img.height;
         final sf = w / sw;
+        final all = [...shapes];
         final out = await ImageOps.render(w, h, (c) {
           ImageOps.drawImageTo(c, img, Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()));
-          if (shapes.isNotEmpty) {
+          if (all.isNotEmpty) {
             c.save();
             c.translate(w / 2, h / 2);
             c.scale(sf);
-            HighlightRenderer.paintAll(c, shapes, layerBounds: Rect.fromLTWH(-sw / 2, -sh / 2, sw, sh));
+            HighlightRenderer.paintAll(c, all, layerBounds: Rect.fromLTWH(-sw / 2, -sh / 2, sw, sh));
             c.restore();
           }
         });
         final jpg = await ImageOps.encodeJpeg(out, 0.95);
-        if (!mounted) return;
-        Navigator.of(context).pop(PhotoItem(
+        result = PhotoItem(
           src: jpg,
           image: out,
           orig: o.orig,
@@ -1009,37 +1259,69 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
           adj: o.adj.copy(),
           viewW: o.viewW,
           adjBase: o.adjBase,
-        ));
-        return;
+        );
+      } else {
+        final rot = await ImageOps.rotated(img, rotation);
+        final w = rot.width.toDouble(), h = rot.height.toDouble();
+        final rx = w / sw, ry = h / sh;
+        final q = pts.map((p) => Offset(p.x * rx, p.y * ry)).toList();
+        final newW = math.max(1, math.max((q[1] - q[0]).distance, (q[2] - q[3]).distance).floor());
+        final newH = math.max(1, math.max((q[1] - q[2]).distance, (q[0] - q[3]).distance).floor());
+        var out = await ImageOps.perspectiveWarp(rot, q, newW, newH);
+        final pending = _pendingOcrText;
+        if (pending != null && pending.trim().isNotEmpty) {
+          // Burn the OCR text onto the cropped photo (same renderer as layers).
+          final cw = out.width, ch = out.height;
+          final vw = 360.0, vh = 360.0 * ch / cw;
+          final layer = ocrTextLayer(pending, vw, vh, 0xFF000000);
+          final base = out;
+          out = await ImageOps.render(cw, ch, (c) {
+            ImageOps.drawImageTo(c, base, Rect.fromLTWH(0, 0, cw.toDouble(), ch.toDouble()));
+            c.save();
+            c.translate(cw / 2, ch / 2);
+            c.scale(cw / vw);
+            HighlightRenderer.paintAll(c, [layer], layerBounds: Rect.fromLTWH(-vw / 2, -vh / 2, vw, vh));
+            c.restore();
+          });
+        }
+        final jpg = await ImageOps.encodeJpeg(out, 0.95);
+        result = PhotoItem(
+          src: jpg,
+          image: out,
+          orig: o.orig,
+          display: jpg,
+          croppedBase: jpg,
+          savedPts: pts.map((p) => Pt(p.x / sw, p.y / sh)).toList(),
+          rotation: rotation,
+          scanPhotoCount: o.scanPhotoCount,
+          adj: o.adj.copy(),
+        );
+        if (mounted) toast('Applied • ${out.width}×${out.height}px${_cropIsFullFrame && rotation % 360 == 0 ? ' (full photo – drag the corner handles to crop)' : ''}');
       }
-      final rot = await ImageOps.rotated(img, rotation);
-      final w = rot.width.toDouble(), h = rot.height.toDouble();
-      final rx = w / sw, ry = h / sh;
-      final q = pts.map((p) => Offset(p.x * rx, p.y * ry)).toList();
-      final newW = math.max((q[1] - q[0]).distance, (q[2] - q[3]).distance);
-      final newH = math.max((q[1] - q[2]).distance, (q[0] - q[3]).distance);
-      final out = await ImageOps.perspectiveWarp(rot, q, math.max(1, newW.floor()), math.max(1, newH.floor()));
-      final jpg = await ImageOps.encodeJpeg(out, 0.95);
       if (!mounted) return;
-      Navigator.of(context).pop(PhotoItem(
-        src: jpg,
-        image: out,
-        orig: o.orig,
-        display: jpg,
-        croppedBase: jpg,
-        savedPts: pts.map((p) => Pt(p.x / sw, p.y / sh)).toList(),
-        rotation: rotation,
-        scanPhotoCount: o.scanPhotoCount,
-        adj: o.adj.copy(),
-      ));
+      _committed = true;
+      Navigator.of(context).pop(result);
+    } catch (e, st) {
+      debugPrint('applyScan failed: $e\n$st');
+      if (mounted) {
+        setState(() => busy = null);
+        await showGlassAlert(context, 'Photo apply nahi ho paayi.\n$e');
+      }
     } finally {
-      if (mounted) setState(() => busy = null);
+      if (mounted && busy != null) setState(() => busy = null);
     }
   }
 
+  /// Cancel: discard every pending change (restored in [dispose]).
   void closeScan() {
     hideTextInput();
     Navigator.of(context).pop();
+  }
+
+  bool get _cropIsFullFrame {
+    if (pts.length < 4 || sw == 0 || sh == 0) return false;
+    final e = 4.0;
+    return pts[0].x.abs() < e && pts[0].y.abs() < e && (pts[2].x - sw).abs() < e && (pts[2].y - sh).abs() < e;
   }
 
   // ================================================================= UI
@@ -1171,7 +1453,7 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
                     ),
                   ),
                 ),
-                Positioned.fill(child: ValueListenableBuilder<int>(valueListenable: tick, builder: (_, _, _) => _overlays())),
+                Positioned.fill(child: ValueListenableBuilder<int>(valueListenable: overlayTick, builder: (_, _, _) => _overlays())),
               ]),
             ),
           ),
@@ -1257,8 +1539,8 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
     if (magPos != null) {
       final off = magPos!.dy < 200 ? 100.0 : -200.0;
       kids.add(Positioned(
-        left: magPos!.dx - 70,
-        top: magPos!.dy + off,
+        left: (magPos!.dx - 70).clamp(0.0, math.max(0.0, sw - 140)),
+        top: (magPos!.dy + off).clamp(0.0, math.max(0.0, sh - 140)),
         width: 140,
         height: 140,
         child: IgnorePointer(
@@ -1319,6 +1601,7 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
                         labelOf: (v) => shapeTypes.firstWhere((e) => e.$1 == v).$2,
                         onChanged: (v) {
                           shapeType = v;
+                          moveTool = v == 'select';
                           handleShapeTypeChange();
                         },
                       ),
@@ -1327,13 +1610,13 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
                       Row(mainAxisSize: MainAxisSize.min, children: [
                         lbl('Blend Mode:'),
                         const SizedBox(width: 5),
-                        GlassSelect<String>(
+                        Flexible(child: GlassSelect<String>(
                           fontSize: 11,
                           value: blendMode,
                           items: blendModes.map((e) => e.$1).toList(),
                           labelOf: (v) => blendModes.firstWhere((e) => e.$1 == v).$2,
                           onChanged: changeLayerBlendMode,
-                        ),
+                        )),
                       ]),
                       Row(mainAxisSize: MainAxisSize.min, children: [
                         lbl('Size / Brush:'),
@@ -1528,52 +1811,94 @@ class _ScanEditorScreenState extends State<ScanEditorScreen> {
     ).animate().fadeIn(duration: 180.ms).scale(begin: const Offset(0.95, 0.95), alignment: Alignment.bottomRight, curve: Curves.easeOutBack);
   }
 
+  void toggleMoveTool() {
+    hideTextInput();
+    editorMode = 'highlight';
+    moveTool = !moveTool;
+    if (moveTool) {
+      if (shapeType != 'select') prevDrawingType = shapeType;
+      shapeType = 'select';
+    } else {
+      shapeType = prevDrawingType;
+    }
+    dpadOpen = false;
+    setState(() {});
+    redraw();
+  }
+
   Widget _bottomBar(AppPalette p) {
     final crop = modalEntryMode == 'crop';
     final hl = modalEntryMode == 'highlight';
-    final btn = <Widget>[
-      if (!collapsed) GlassButton(label: '✨ Text OCR', color: AppColors.teal, fontSize: 13, padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8), onTap: ocrBusy ? null : runOCRScan),
-      if (!collapsed && o.ocrWords.isNotEmpty)
-        GlassButton(label: 'Clear Text HL', color: AppColors.red, fontSize: 13, padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8), onTap: clearOCRHighlights),
+    final mq = MediaQuery.of(context);
+    final avail = mq.size.width - 24;
+    final cols = avail < 420 ? 3 : (avail < 700 ? 4 : 6);
+    const gap = 8.0;
+    final tileW = (avail - gap * (cols - 1)) / cols;
+    Widget chip(String label, VoidCallback? onTap, {Color? color, Color? textColor, bool active = false, Color activeColor = AppColors.blue, String? emoji}) => SizedBox(
+          width: tileW,
+          height: 44, // >= 44 dp touch target
+          child: GlassButton(
+            label: label,
+            emoji: emoji,
+            color: color,
+            textColor: textColor,
+            active: active,
+            activeColor: activeColor,
+            fontSize: 12,
+            expand: true,
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+            onTap: onTap,
+          ),
+        );
+    final chips = <Widget>[
+      chip('Text OCR', ocrBusy ? null : runOCRScan, color: AppColors.teal, emoji: '✨'),
+      if (ocrText.trim().isNotEmpty) chip('OCR Text', _showOcrSheet, color: AppColors.teal, emoji: '📄'),
+      if (hl && o.ocrWords.isNotEmpty) chip('Clear Text HL', clearOCRHighlights, color: AppColors.red),
       if (crop) ...[
-        GlassButton(label: '✨ Auto Detect', color: AppColors.amethyst, fontSize: 13, padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8), onTap: runAutoEdgeDetection),
-        GlassButton(label: '📐 Canvas Size', color: AppColors.pumpkin, fontSize: 13, padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8), onTap: () => setState(() => csOpen = true)),
-        GlassButton(label: 'No Crop', color: AppColors.orange, fontSize: 13, padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8), onTap: noCrop),
-        GlassButton(label: 'Rotate 90°', fontSize: 13, padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8), onTap: rotateScan),
+        chip('Auto Detect', runAutoEdgeDetection, color: AppColors.amethyst, emoji: '✨'),
+        chip('Canvas Size', () => setState(() => csOpen = true), color: AppColors.pumpkin, emoji: '📐'),
+        chip('No Crop', noCrop, color: AppColors.orange),
+        chip('Rotate 90°', rotateScan),
       ],
       if (hl) ...[
-        GlassButton(
-          label: 'Zoom & Pan',
-          color: editorMode == 'zoom' ? const Color(0xFF9B59B6) : AppColors.slate,
-          bold: editorMode == 'zoom',
-          fontSize: 13,
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-          onTap: () => setEditorMode('zoom'),
-        ),
-        GlassButton(
-          label: editorMode == 'highlight' ? 'Highlight: ON' : 'Highlight Mode',
-          color: editorMode == 'highlight' ? AppColors.yellow : AppColors.slate,
-          textColor: editorMode == 'highlight' ? Colors.black : Colors.white,
-          bold: editorMode == 'highlight',
-          fontSize: 13,
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-          onTap: () => setEditorMode('highlight'),
-        ),
+        chip('Zoom & Pan', () => setEditorMode('zoom'), color: editorMode == 'zoom' ? const Color(0xFF9B59B6) : AppColors.slate),
+        chip(editorMode == 'highlight' ? 'Highlight: ON' : 'Highlight', () => setEditorMode('highlight'),
+            color: editorMode == 'highlight' ? AppColors.yellow : AppColors.slate, textColor: editorMode == 'highlight' ? Colors.black : Colors.white),
+        chip('Select / Move', toggleMoveTool,
+            emoji: '✋', color: moveTool && editorMode == 'highlight' ? AppColors.blue : AppColors.slate, textColor: Colors.white),
       ],
-      GlassButton(label: crop ? 'Apply Crop' : 'Apply Highlights', color: AppColors.green, bold: true, fontSize: 13, padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8), onTap: busy == null ? applyScan : null),
-      GlassButton(label: 'Cancel', color: AppColors.darkGrey, fontSize: 13, padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8), onTap: closeScan),
     ];
     return ClipRect(
       child: BackdropFilter(
         filter: ui.ImageFilter.blur(sigmaX: 24, sigmaY: 24),
         child: Container(
           width: double.infinity,
-          padding: EdgeInsets.fromLTRB(12, 12, 12, 12 + MediaQuery.paddingOf(context).bottom),
+          padding: EdgeInsets.fromLTRB(12, 10, 12, 10 + mq.padding.bottom),
           decoration: BoxDecoration(
             color: p.bgHeader.withValues(alpha: 0.88),
             border: Border(top: BorderSide(color: p.glassBorder.withValues(alpha: 0.35))),
           ),
-          child: Wrap(alignment: WrapAlignment.center, spacing: 8, runSpacing: 8, children: btn),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Wrap(alignment: WrapAlignment.center, spacing: gap, runSpacing: gap, children: chips),
+            const SizedBox(height: 10),
+            Row(children: [
+              Expanded(
+                flex: 2,
+                child: SizedBox(
+                  height: 48,
+                  child: GlassButton(label: 'Cancel', color: AppColors.darkGrey, expand: true, fontSize: 14, onTap: busy == null ? closeScan : null),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                flex: 3,
+                child: SizedBox(
+                  height: 48,
+                  child: GlassButton(label: 'Done', emoji: '✓', color: AppColors.green, bold: true, expand: true, fontSize: 16, onTap: busy == null ? applyScan : null),
+                ),
+              ),
+            ]),
+          ]),
         ),
       ),
     );
